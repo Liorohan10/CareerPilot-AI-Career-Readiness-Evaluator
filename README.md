@@ -1,4 +1,4 @@
-# AI Recruitment Agent
+# CareerPilot – AI Career Readiness Evaluator
 
 A candidate-focused AI career readiness MVP that analyzes a user's resume against desired roles or a specific job description, then generates SWOT analysis, skill gaps, a learning roadmap, likely interview questions, and interview prep.
 
