@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import TypedDict
 
 from backend.agents.llm_recruitment_agent import (
@@ -9,6 +10,8 @@ from backend.agents.llm_recruitment_agent import (
 )
 from backend.agents.report_generation_agent import generate_report
 from backend.models import CareerPrepPlan, RecruitmentReport, ResumeProfile, SkillMatch
+from backend.services.vector_service import get_semantic_overlaps
+from backend.services.db_service import save_candidate, save_job, create_application
 
 
 class RecruitmentState(TypedDict, total=False):
@@ -27,12 +30,20 @@ def parse_resume_node(state: RecruitmentState) -> dict[str, ResumeProfile]:
 
 
 def match_skills_node(state: RecruitmentState) -> dict[str, SkillMatch]:
+    semantic_context = ""
+    if state["analysis_mode"] == "jd_fit" and state.get("job_description"):
+        semantic_context = get_semantic_overlaps(
+            state["resume_text"], 
+            state["job_description"]
+        )
+
     return {
         "skill_match": match_skills_with_llm(
             profile=state["profile"],
             desired_roles=state["desired_roles"],
             analysis_mode=state["analysis_mode"],
             job_description=state.get("job_description", ""),
+            semantic_context=semantic_context,
         )
     }
 
@@ -92,9 +103,47 @@ def run_recruitment_workflow(
         }
     )
 
+    # 1. Extract details and save to SQLite DB
+    profile = final_state["profile"]
+    skill_match = final_state["skill_match"]
+    prep_plan = final_state["prep_plan"]
+    report = final_state["report"]
+
+    candidate_name = profile.candidate_name or "Candidate"
+    candidate_email = profile.candidate_email or ""
+    candidate_id = save_candidate(candidate_name, candidate_email, resume_text)
+
+    # 2. Save job if JD fit mode
+    job_id = None
+    if analysis_mode == "jd_fit":
+        job_title = desired_roles[0] if desired_roles else "Unknown Role"
+        job_id = save_job(job_title, job_description, desired_roles)
+
+    # 3. Create application record
+    report_data = {
+        "profile": profile.model_dump(),
+        "skill_match": skill_match.model_dump(),
+        "career_prep_plan": prep_plan.model_dump(),
+        "report": report
+    }
+    report_json = json.dumps(report_data)
+    
+    fit_score = skill_match.match_score
+    status = "proceeded_to_interview" if fit_score >= 70 else "analyzed"
+
+    application_id = create_application(
+        candidate_id=candidate_id,
+        job_id=job_id,
+        analysis_mode=analysis_mode,
+        fit_score=fit_score,
+        report_json=report_json,
+        status=status
+    )
+
     return RecruitmentReport(
-        resume_profile=final_state["profile"],
-        skill_match=final_state["skill_match"],
-        career_prep_plan=final_state["prep_plan"],
-        report=final_state["report"],
+        application_id=application_id,
+        resume_profile=profile,
+        skill_match=skill_match,
+        career_prep_plan=prep_plan,
+        report=report,
     )

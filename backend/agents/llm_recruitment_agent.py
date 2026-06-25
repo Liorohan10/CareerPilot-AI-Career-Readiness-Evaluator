@@ -5,18 +5,18 @@ import time
 from collections.abc import Callable
 from typing import TypeVar
 
+import httpx
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 
 from backend.models import CareerPrepPlan, ResumeProfile, SkillMatch
 from backend.services.env_loader import load_local_env
 
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 T = TypeVar("T")
 
 
-def invoke_groq_with_retries(action: Callable[[], T]) -> T:
+def invoke_llm_with_retries(action: Callable[[], T]) -> T:
     delays = [1.0, 2.0, 4.0]
     for attempt, delay in enumerate(delays):
         try:
@@ -32,16 +32,26 @@ def invoke_groq_with_retries(action: Callable[[], T]) -> T:
     return action()
 
 
-def get_groq_llm(temperature: float = 0.1) -> ChatGroq:
+def get_llm(temperature: float = 0.1) -> ChatOpenAI:
     load_local_env()
-    if not os.getenv("GROQ_API_KEY"):
-        raise RuntimeError("GROQ_API_KEY is required to run the LangGraph AI workflow.")
+    api_key = os.getenv("GENAILAB_API_KEY")
+    if not api_key:
+        raise RuntimeError("GENAILAB_API_KEY is required to run the LangGraph AI workflow.")
 
-    return ChatGroq(
-        model=os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL),
+    model = os.getenv("GENAILAB_MODEL", "azure_ai/genailab-maas-DeepSeek-V3-0324")
+
+    # Enterprise proxy / SSL verification disable via custom client
+    client = httpx.Client(verify=False)
+
+    return ChatOpenAI(
+        base_url="https://genailab.tcs.in",
+        model=model,
+        api_key=api_key,
+        http_client=client,
         temperature=temperature,
-        max_retries=2,
     )
+
+
 
 
 def analyze_resume_with_llm(resume_text: str) -> ResumeProfile:
@@ -50,7 +60,8 @@ def analyze_resume_with_llm(resume_text: str) -> ResumeProfile:
         [
             (
                 "system",
-                "You are a resume screening agent. Extract structured information from the resume. "
+                "You are a resume screening agent. Extract structured information from the resume, "
+                "including the candidate's name and contact email. "
                 "Do not invent skills, education, certifications, projects, or years of experience. "
                 "If something is missing, return an empty list or 0. Return valid JSON only.",
             ),
@@ -67,8 +78,8 @@ Resume:
             ),
         ]
     )
-    chain = prompt | get_groq_llm() | parser
-    return invoke_groq_with_retries(
+    chain = prompt | get_llm() | parser
+    return invoke_llm_with_retries(
         lambda: chain.invoke(
             {
                 "resume_text": resume_text,
@@ -83,15 +94,19 @@ def match_skills_with_llm(
     desired_roles: list[str],
     analysis_mode: str,
     job_description: str = "",
+    semantic_context: str = "",
 ) -> SkillMatch:
     parser = PydanticOutputParser(pydantic_object=SkillMatch)
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
-                "You are a skill matching agent. Compare the candidate profile against the target roles "
+                "You are an advanced skill matching agent. Compare the candidate profile against the target roles "
                 "and, when provided, the job description. Return a realistic match score from 0 to 100, "
                 "required skills, skills the candidate already has, and missing skills. "
+                "Utilize the provided semantic/vector overlaps between the resume and the job description "
+                "to evaluate overall fit, transferable skills, and conceptual relevance, "
+                "rather than strictly matching keywords. "
                 "Use only evidence from the resume profile for strong areas. Return valid JSON only.",
             ),
             (
@@ -104,20 +119,24 @@ Job description: {job_description}
 Candidate resume profile:
 {profile}
 
-Return the candidate-role match as structured data.
+Semantic/Vector Overlaps Context:
+{semantic_context}
+
+Return the candidate-role match as structured data, evaluating based on semantic fit rather than pure keyword matching.
 
 {format_instructions}
 """,
             ),
         ]
     )
-    chain = prompt | get_groq_llm() | parser
-    return invoke_groq_with_retries(
+    chain = prompt | get_llm() | parser
+    return invoke_llm_with_retries(
         lambda: chain.invoke(
             {
                 "analysis_mode": analysis_mode,
                 "desired_roles": ", ".join(desired_roles),
                 "job_description": job_description or "Not provided",
+                "semantic_context": semantic_context or "No vector-similarity overlaps computed.",
                 "profile": profile.model_dump(),
                 "format_instructions": parser.get_format_instructions(),
             }
@@ -170,8 +189,8 @@ Use role_fit_score from the skill match score.
             ),
         ]
     )
-    chain = prompt | get_groq_llm(temperature=0.2) | parser
-    plan = invoke_groq_with_retries(
+    chain = prompt | get_llm(temperature=0.2) | parser
+    plan = invoke_llm_with_retries(
         lambda: chain.invoke(
             {
                 "analysis_mode": analysis_mode,
@@ -184,7 +203,106 @@ Use role_fit_score from the skill match score.
         )
     )
     plan.analysis_mode = analysis_mode
-    plan.analysis_source = "groq_llm"
+    plan.analysis_source = "deepseek_llm"
     plan.target_roles = target_roles
     plan.role_fit_score = skill_match.match_score
     return plan
+
+
+from pydantic import BaseModel, Field
+
+class InterviewQuestions(BaseModel):
+    questions: list[str] = Field(min_length=5, max_length=5, description="List of exactly 5 interview questions")
+
+
+class InterviewFeedback(BaseModel):
+    feedback: str = Field(description="Detailed evaluation report of the candidate's answers, describing strengths and improvement areas")
+    score: int = Field(description="Overall interview score from 0 to 100")
+
+
+def generate_interview_questions(job_description: str, role: str) -> list[str]:
+    parser = PydanticOutputParser(pydantic_object=InterviewQuestions)
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are an expert interviewer. Generate a list of exactly 5 relevant technical and behavioral "
+                "interview questions for the specified candidate role based on the job description. "
+                "Do not include introductory or general banter; focus on specific, challenging, and relevant questions. "
+                "Return valid JSON matching the schema.",
+            ),
+            (
+                "human",
+                """
+Target Role: {role}
+Job Description: {job_description}
+
+Generate exactly 5 interview questions based on the role and job description.
+
+{format_instructions}
+""",
+            ),
+        ]
+    )
+    chain = prompt | get_llm(temperature=0.5) | parser
+    res = invoke_llm_with_retries(
+        lambda: chain.invoke(
+            {
+                "role": role,
+                "job_description": job_description or "Not provided",
+                "format_instructions": parser.get_format_instructions(),
+            }
+        )
+    )
+    return res.questions
+
+
+def evaluate_interview_responses(
+    questions: list[str],
+    answers: list[str],
+    job_description: str,
+    role: str
+) -> dict:
+    parser = PydanticOutputParser(pydantic_object=InterviewFeedback)
+    transcript = ""
+    for idx, (q, a) in enumerate(zip(questions, answers), start=1):
+        transcript += f"Question {idx}: {q}\nCandidate Answer: {a or '[No Answer Provided]'}\n\n"
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are an expert technical interviewer and hiring manager. Evaluate the candidate's "
+                "interview transcript based on the role and job description. "
+                "Return a detailed text feedback report and an overall score from 0 to 100. "
+                "Be critical but constructive. Return valid JSON matching the schema.",
+            ),
+            (
+                "human",
+                """
+Target Role: {role}
+Job Description: {job_description}
+
+Interview Transcript:
+{transcript}
+
+Evaluate this transcript. Provide constructive feedback outlining strengths and improvements, and a realistic score.
+
+{format_instructions}
+""",
+            ),
+        ]
+    )
+    chain = prompt | get_llm(temperature=0.2) | parser
+    res = invoke_llm_with_retries(
+        lambda: chain.invoke(
+            {
+                "role": role,
+                "job_description": job_description or "Not provided",
+                "transcript": transcript,
+                "format_instructions": parser.get_format_instructions(),
+            }
+        )
+    )
+    return res.model_dump()
+
